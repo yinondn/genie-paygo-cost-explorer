@@ -1,0 +1,3734 @@
+{
+  "datasets": [
+    {
+      "name": "billing_detail",
+      "displayName": "Billing Detail",
+      "queryLines": [
+        "WITH params AS (\n  SELECT\n    DATE_SUB(CURRENT_DATE(), 29) AS start_date,\n    DATE_ADD(CURRENT_DATE(), 1) AS end_date_exclusive,\n    CAST(NULL AS STRING) AS target_workspace_id\n),\npriced_usage AS (\n  SELECT\n    u.usage_date,\n    DATE_TRUNC('HOUR', u.usage_start_time) AS usage_hour_utc,\n    u.account_id,\n    u.workspace_id,\n    u.identity_metadata.run_as AS attributed_user_name,\n    COALESCE(u.identity_metadata.run_as, 'Unattributed') AS user_name,\n    CASE\n      WHEN u.identity_metadata.run_as IS NULL THEN 'Missing'\n      ELSE 'Populated'\n    END AS user_attribution_status,\n    COALESCE(u.usage_metadata.genie.surface, 'Unknown') AS genie_surface,\n    COALESCE(u.usage_metadata.genie.channel, 'Unknown') AS genie_channel,\n    COALESCE(u.usage_metadata.genie.agent_id, 'Not available') AS agent_id,\n    COALESCE(u.product_features.genie.offering_type, 'Unknown') AS offering_type,\n    u.cloud,\n    u.sku_name,\n    u.usage_unit,\n    COALESCE(u.usage_type, 'Unknown') AS usage_type,\n    u.record_type,\n    COALESCE(lp.currency_code, 'Unknown') AS currency_code,\n    CASE WHEN lp.sku_name IS NULL THEN 'Missing price' ELSE 'Priced' END AS price_status,\n    u.usage_quantity,\n    u.usage_quantity * lp.pricing.effective_list.default AS list_cost\n  FROM system.billing.usage AS u\n  CROSS JOIN params AS p\n  LEFT JOIN system.billing.list_prices AS lp\n    ON u.account_id = lp.account_id\n    AND u.cloud = lp.cloud\n    AND u.sku_name = lp.sku_name\n    AND u.usage_unit = lp.usage_unit\n    AND u.usage_start_time >= lp.price_start_time\n    AND (u.usage_start_time < lp.price_end_time OR lp.price_end_time IS NULL)\n  WHERE u.billing_origin_product = 'GENIE'\n    AND u.usage_date >= p.start_date\n    AND u.usage_date < p.end_date_exclusive\n    AND (p.target_workspace_id IS NULL OR u.workspace_id = p.target_workspace_id)\n)\nSELECT\n  usage_date,\n  usage_hour_utc,\n  account_id,\n  workspace_id,\n  attributed_user_name,\n  user_name,\n  user_attribution_status,\n  genie_surface,\n  genie_channel,\n  agent_id,\n  offering_type,\n  cloud,\n  sku_name,\n  usage_unit,\n  usage_type,\n  record_type,\n  currency_code,\n  price_status,\n  COUNT(*) AS billing_records,\n  ROUND(SUM(usage_quantity), 6) AS usage_quantity,\n  ROUND(SUM(list_cost), 6) AS list_cost\nFROM priced_usage\nGROUP BY ALL"
+      ]
+    },
+    {
+      "name": "driver_rankings",
+      "displayName": "Driver Rankings",
+      "queryLines": [
+        "WITH params AS (\n  SELECT\n    DATE_SUB(CURRENT_DATE(), 29) AS start_date,\n    DATE_ADD(CURRENT_DATE(), 1) AS end_date_exclusive,\n    CAST(NULL AS STRING) AS target_workspace_id\n),\npriced_usage AS (\n  SELECT\n    u.workspace_id,\n    u.identity_metadata.run_as AS user_name,\n    u.usage_metadata.genie.surface AS genie_surface,\n    u.usage_metadata.genie.channel AS genie_channel,\n    u.usage_metadata.genie.agent_id AS agent_id,\n    u.sku_name,\n    u.usage_quantity,\n    u.usage_quantity * lp.pricing.effective_list.default AS list_cost\n  FROM system.billing.usage AS u\n  CROSS JOIN params AS p\n  INNER JOIN system.billing.list_prices AS lp\n    ON u.account_id = lp.account_id\n    AND u.cloud = lp.cloud\n    AND u.sku_name = lp.sku_name\n    AND u.usage_unit = lp.usage_unit\n    AND u.usage_start_time >= lp.price_start_time\n    AND (u.usage_start_time < lp.price_end_time OR lp.price_end_time IS NULL)\n  WHERE u.billing_origin_product = 'GENIE'\n    AND u.usage_date >= p.start_date\n    AND u.usage_date < p.end_date_exclusive\n    AND (p.target_workspace_id IS NULL OR u.workspace_id = p.target_workspace_id)\n),\ndimensioned AS (\n  SELECT 'User' AS dimension_type, COALESCE(user_name, 'Unattributed') AS dimension_value, usage_quantity, list_cost FROM priced_usage\n  UNION ALL\n  SELECT 'Workspace', workspace_id, usage_quantity, list_cost FROM priced_usage\n  UNION ALL\n  SELECT 'Surface', COALESCE(genie_surface, 'Unknown'), usage_quantity, list_cost FROM priced_usage\n  UNION ALL\n  SELECT 'Channel', COALESCE(genie_channel, 'Unknown'), usage_quantity, list_cost FROM priced_usage\n  UNION ALL\n  SELECT 'Agent or space ID', agent_id, usage_quantity, list_cost FROM priced_usage WHERE agent_id IS NOT NULL\n  UNION ALL\n  SELECT 'SKU', sku_name, usage_quantity, list_cost FROM priced_usage\n),\naggregated AS (\n  SELECT\n    dimension_type,\n    dimension_value,\n    COUNT(*) AS billing_records,\n    SUM(usage_quantity) AS usage_quantity,\n    SUM(list_cost) AS list_cost\n  FROM dimensioned\n  GROUP BY dimension_type, dimension_value\n),\nranked AS (\n  SELECT\n    dimension_type,\n    dimension_value,\n    billing_records,\n    usage_quantity,\n    list_cost,\n    list_cost / NULLIF(SUM(list_cost) OVER (PARTITION BY dimension_type), 0) AS share_of_cost,\n    ROW_NUMBER() OVER (\n      PARTITION BY dimension_type\n      ORDER BY list_cost DESC, dimension_value\n    ) AS driver_rank\n  FROM aggregated\n)\nSELECT\n  driver_rank,\n  MAX(CASE WHEN dimension_type = 'User' THEN dimension_value END) AS top_user,\n  ROUND(MAX(CASE WHEN dimension_type = 'User' THEN list_cost END), 6) AS top_user_cost,\n  ROUND(MAX(CASE WHEN dimension_type = 'User' THEN share_of_cost END), 6) AS top_user_share,\n  MAX(CASE WHEN dimension_type = 'Workspace' THEN dimension_value END) AS top_workspace,\n  ROUND(MAX(CASE WHEN dimension_type = 'Workspace' THEN list_cost END), 6) AS top_workspace_cost,\n  ROUND(MAX(CASE WHEN dimension_type = 'Workspace' THEN share_of_cost END), 6) AS top_workspace_share,\n  MAX(CASE WHEN dimension_type = 'Agent or space ID' THEN dimension_value END) AS top_agent_or_space_id,\n  ROUND(MAX(CASE WHEN dimension_type = 'Agent or space ID' THEN list_cost END), 6) AS top_agent_or_space_cost,\n  ROUND(MAX(CASE WHEN dimension_type = 'Agent or space ID' THEN share_of_cost END), 6) AS top_agent_or_space_share,\n  MAX(CASE WHEN dimension_type = 'SKU' THEN dimension_value END) AS top_sku,\n  ROUND(MAX(CASE WHEN dimension_type = 'SKU' THEN list_cost END), 6) AS top_sku_cost,\n  MAX(CASE WHEN dimension_type = 'Surface' THEN dimension_value END) AS top_surface,\n  ROUND(MAX(CASE WHEN dimension_type = 'Surface' THEN list_cost END), 6) AS top_surface_cost,\n  MAX(CASE WHEN dimension_type = 'Channel' THEN dimension_value END) AS top_channel,\n  ROUND(MAX(CASE WHEN dimension_type = 'Channel' THEN list_cost END), 6) AS top_channel_cost\nFROM ranked\nWHERE driver_rank <= 15\nGROUP BY driver_rank\nORDER BY driver_rank"
+      ]
+    },
+    {
+      "name": "daily_trends",
+      "displayName": "Daily Trends",
+      "queryLines": [
+        "WITH params AS (\n  SELECT\n    DATE_SUB(CURRENT_DATE(), 29) AS output_start_date,\n    DATE_SUB(CURRENT_DATE(), 36) AS scan_start_date,\n    DATE_ADD(CURRENT_DATE(), 1) AS end_date_exclusive,\n    CAST(NULL AS STRING) AS target_workspace_id\n),\ndaily AS (\n  SELECT\n    u.usage_date,\n    COALESCE(u.usage_metadata.genie.surface, 'Unknown') AS genie_surface,\n    COALESCE(u.usage_metadata.genie.channel, 'Unknown') AS genie_channel,\n    COUNT(*) AS billing_records,\n    COUNT(DISTINCT u.workspace_id) AS distinct_workspaces,\n    COUNT(DISTINCT u.identity_metadata.run_as) AS distinct_users,\n    SUM(u.usage_quantity) AS usage_quantity,\n    SUM(u.usage_quantity * lp.pricing.effective_list.default) AS list_cost\n  FROM system.billing.usage AS u\n  CROSS JOIN params AS p\n  INNER JOIN system.billing.list_prices AS lp\n    ON u.account_id = lp.account_id\n    AND u.cloud = lp.cloud\n    AND u.sku_name = lp.sku_name\n    AND u.usage_unit = lp.usage_unit\n    AND u.usage_start_time >= lp.price_start_time\n    AND (u.usage_start_time < lp.price_end_time OR lp.price_end_time IS NULL)\n  WHERE u.billing_origin_product = 'GENIE'\n    AND u.usage_date >= p.scan_start_date\n    AND u.usage_date < p.end_date_exclusive\n    AND (p.target_workspace_id IS NULL OR u.workspace_id = p.target_workspace_id)\n  GROUP BY ALL\n),\nwith_baselines AS (\n  SELECT\n    d.usage_date,\n    d.genie_surface,\n    d.genie_channel,\n    d.billing_records,\n    d.distinct_workspaces,\n    d.distinct_users,\n    d.usage_quantity,\n    d.list_cost,\n    prior_day.list_cost AS prior_day_cost,\n    COALESCE(SUM(prior_7d.list_cost), 0) / 7 AS prior_7d_avg_cost\n  FROM daily AS d\n  LEFT JOIN daily AS prior_day\n    ON prior_day.genie_surface = d.genie_surface\n    AND prior_day.genie_channel = d.genie_channel\n    AND prior_day.usage_date = DATE_SUB(d.usage_date, 1)\n  LEFT JOIN daily AS prior_7d\n    ON prior_7d.genie_surface = d.genie_surface\n    AND prior_7d.genie_channel = d.genie_channel\n    AND prior_7d.usage_date >= DATE_SUB(d.usage_date, 7)\n    AND prior_7d.usage_date < d.usage_date\n  GROUP BY\n    d.usage_date,\n    d.genie_surface,\n    d.genie_channel,\n    d.billing_records,\n    d.distinct_workspaces,\n    d.distinct_users,\n    d.usage_quantity,\n    d.list_cost,\n    prior_day.list_cost\n)\nSELECT\n  usage_date,\n  genie_surface,\n  genie_channel,\n  billing_records,\n  distinct_workspaces,\n  distinct_users,\n  ROUND(usage_quantity, 6) AS usage_quantity,\n  ROUND(list_cost, 6) AS list_cost,\n  ROUND(prior_day_cost, 6) AS prior_day_cost,\n  ROUND(prior_7d_avg_cost, 6) AS prior_7d_avg_cost,\n  ROUND((list_cost - prior_7d_avg_cost) / NULLIF(prior_7d_avg_cost, 0), 6) AS variance_vs_prior_7d\nFROM with_baselines\nCROSS JOIN params AS p\nWHERE usage_date >= p.output_start_date\n  AND usage_date < p.end_date_exclusive"
+      ]
+    },
+    {
+      "name": "attribution_quality",
+      "displayName": "Attribution Quality",
+      "queryLines": [
+        "WITH params AS (\n  SELECT\n    DATE_SUB(CURRENT_DATE(), 29) AS start_date,\n    DATE_ADD(CURRENT_DATE(), 1) AS end_date_exclusive,\n    CAST(NULL AS STRING) AS target_workspace_id\n),\nquality AS (\n  SELECT\n    u.usage_date,\n    u.workspace_id,\n    COALESCE(u.usage_metadata.genie.surface, 'Unknown') AS genie_surface,\n    COALESCE(u.usage_metadata.genie.channel, 'Unknown') AS genie_channel,\n    COUNT(*) AS billing_records,\n    COUNT_IF(u.identity_metadata.run_as IS NOT NULL) AS records_with_user,\n    COUNT_IF(u.identity_metadata.run_as IS NULL) AS records_without_user,\n    COUNT_IF(u.usage_metadata.genie.agent_id IS NOT NULL) AS records_with_agent_id,\n    COUNT_IF(lp.sku_name IS NOT NULL) AS records_with_price,\n    COUNT(DISTINCT u.identity_metadata.run_as) AS distinct_users,\n    COUNT(DISTINCT u.usage_metadata.genie.agent_id) AS distinct_agent_ids,\n    SUM(u.usage_quantity * lp.pricing.effective_list.default) AS list_cost,\n    SUM(\n      CASE\n        WHEN u.identity_metadata.run_as IS NULL\n        THEN u.usage_quantity * lp.pricing.effective_list.default\n        ELSE 0\n      END\n    ) AS unattributed_list_cost\n  FROM system.billing.usage AS u\n  CROSS JOIN params AS p\n  LEFT JOIN system.billing.list_prices AS lp\n    ON u.account_id = lp.account_id\n    AND u.cloud = lp.cloud\n    AND u.sku_name = lp.sku_name\n    AND u.usage_unit = lp.usage_unit\n    AND u.usage_start_time >= lp.price_start_time\n    AND (u.usage_start_time < lp.price_end_time OR lp.price_end_time IS NULL)\n  WHERE u.billing_origin_product = 'GENIE'\n    AND u.usage_date >= p.start_date\n    AND u.usage_date < p.end_date_exclusive\n    AND (p.target_workspace_id IS NULL OR u.workspace_id = p.target_workspace_id)\n  GROUP BY ALL\n)\nSELECT\n  usage_date,\n  workspace_id,\n  genie_surface,\n  genie_channel,\n  billing_records,\n  records_with_user,\n  records_without_user,\n  records_with_agent_id,\n  records_with_price,\n  distinct_users,\n  distinct_agent_ids,\n  ROUND(records_with_user / NULLIF(billing_records, 0), 6) AS user_coverage_ratio,\n  ROUND(records_with_agent_id / NULLIF(billing_records, 0), 6) AS agent_id_coverage_ratio,\n  ROUND(records_with_price / NULLIF(billing_records, 0), 6) AS price_coverage_ratio,\n  ROUND(list_cost, 6) AS list_cost,\n  ROUND(unattributed_list_cost, 6) AS unattributed_list_cost\nFROM quality"
+      ]
+    },
+    {
+      "name": "assistant_activity",
+      "displayName": "Assistant Activity",
+      "queryLines": [
+        "WITH params AS (\n  SELECT\n    DATE_SUB(CURRENT_DATE(), 29) AS start_date,\n    DATE_ADD(CURRENT_DATE(), 1) AS end_date_exclusive,\n    CAST(NULL AS STRING) AS target_workspace_id\n)\nSELECT\n  a.event_date,\n  DATE_TRUNC('HOUR', a.event_time) AS event_hour_utc,\n  a.account_id,\n  a.workspace_id,\n  a.initiated_by AS user_name,\n  COALESCE(a.user_agent, 'Unknown') AS user_agent,\n  COUNT(*) AS assistant_events\nFROM system.access.assistant_events AS a\nCROSS JOIN params AS p\nWHERE a.event_date >= p.start_date\n  AND a.event_date < p.end_date_exclusive\n  AND (p.target_workspace_id IS NULL OR a.workspace_id = p.target_workspace_id)\nGROUP BY ALL"
+      ]
+    },
+    {
+      "name": "user_hour_context",
+      "displayName": "User Hour Context",
+      "queryLines": [
+        "WITH params AS (\n  SELECT\n    DATE_SUB(CURRENT_DATE(), 29) AS start_date,\n    DATE_ADD(CURRENT_DATE(), 1) AS end_date_exclusive,\n    CAST(NULL AS STRING) AS target_workspace_id\n),\ncode_cost AS (\n  SELECT\n    DATE_TRUNC('HOUR', u.usage_start_time) AS activity_hour_utc,\n    u.workspace_id,\n    u.identity_metadata.run_as AS user_name,\n    COUNT(*) AS billing_records,\n    SUM(u.usage_quantity) AS usage_quantity,\n    SUM(u.usage_quantity * lp.pricing.effective_list.default) AS list_cost\n  FROM system.billing.usage AS u\n  CROSS JOIN params AS p\n  INNER JOIN system.billing.list_prices AS lp\n    ON u.account_id = lp.account_id\n    AND u.cloud = lp.cloud\n    AND u.sku_name = lp.sku_name\n    AND u.usage_unit = lp.usage_unit\n    AND u.usage_start_time >= lp.price_start_time\n    AND (u.usage_start_time < lp.price_end_time OR lp.price_end_time IS NULL)\n  WHERE u.billing_origin_product = 'GENIE'\n    AND u.usage_metadata.genie.surface = 'GENIE_CODE'\n    AND u.usage_date >= p.start_date\n    AND u.usage_date < p.end_date_exclusive\n    AND (p.target_workspace_id IS NULL OR u.workspace_id = p.target_workspace_id)\n  GROUP BY ALL\n),\nevents AS (\n  SELECT\n    DATE_TRUNC('HOUR', a.event_time) AS activity_hour_utc,\n    a.workspace_id,\n    a.initiated_by AS user_name,\n    COUNT(*) AS assistant_events\n  FROM system.access.assistant_events AS a\n  CROSS JOIN params AS p\n  WHERE a.event_date >= p.start_date\n    AND a.event_date < p.end_date_exclusive\n    AND (p.target_workspace_id IS NULL OR a.workspace_id = p.target_workspace_id)\n  GROUP BY ALL\n)\nSELECT\n  COALESCE(c.activity_hour_utc, e.activity_hour_utc) AS activity_hour_utc,\n  COALESCE(c.workspace_id, e.workspace_id) AS workspace_id,\n  COALESCE(c.user_name, e.user_name) AS user_name,\n  COALESCE(c.billing_records, 0) AS billing_records,\n  ROUND(COALESCE(c.usage_quantity, 0), 6) AS usage_quantity,\n  ROUND(COALESCE(c.list_cost, 0), 6) AS list_cost,\n  COALESCE(e.assistant_events, 0) AS assistant_events,\n  'Heuristic user/workspace/hour context only - not session attribution' AS attribution_limit\nFROM code_cost AS c\nFULL OUTER JOIN events AS e\n  ON c.activity_hour_utc = e.activity_hour_utc\n  AND c.workspace_id = e.workspace_id\n  AND c.user_name = e.user_name"
+      ]
+    },
+    {
+      "name": "sku_product_detail",
+      "displayName": "Sku Product Detail",
+      "queryLines": [
+        "WITH params AS (\n  SELECT\n    DATE_SUB(CURRENT_DATE(), 29) AS start_date,\n    DATE_ADD(CURRENT_DATE(), 1) AS end_date_exclusive,\n    CAST(NULL AS STRING) AS target_workspace_id\n),\npriced_usage AS (\n  SELECT\n    u.usage_date,\n    u.account_id,\n    u.workspace_id,\n    u.identity_metadata.run_as AS attributed_user_name,\n    COALESCE(u.usage_metadata.genie.surface, 'Unknown') AS genie_product,\n    COALESCE(u.usage_metadata.genie.channel, 'Unknown') AS genie_channel,\n    COALESCE(u.product_features.genie.offering_type, 'Unknown') AS offering_type,\n    u.sku_name,\n    u.usage_unit,\n    COALESCE(u.usage_type, 'Unknown') AS usage_type,\n    u.record_type,\n    COALESCE(lp.currency_code, 'Unknown') AS currency_code,\n    CASE WHEN lp.sku_name IS NULL THEN 'Missing price' ELSE 'Priced' END AS price_status,\n    u.usage_quantity,\n    u.usage_quantity * lp.pricing.effective_list.default AS list_cost\n  FROM system.billing.usage AS u\n  CROSS JOIN params AS p\n  LEFT JOIN system.billing.list_prices AS lp\n    ON u.account_id = lp.account_id\n    AND u.cloud = lp.cloud\n    AND u.sku_name = lp.sku_name\n    AND u.usage_unit = lp.usage_unit\n    AND u.usage_start_time >= lp.price_start_time\n    AND (u.usage_start_time < lp.price_end_time OR lp.price_end_time IS NULL)\n  WHERE u.billing_origin_product = 'GENIE'\n    AND u.usage_date >= p.start_date\n    AND u.usage_date < p.end_date_exclusive\n    AND (p.target_workspace_id IS NULL OR u.workspace_id = p.target_workspace_id)\n)\nSELECT\n  usage_date,\n  account_id,\n  workspace_id,\n  genie_product,\n  genie_channel,\n  offering_type,\n  sku_name,\n  usage_unit,\n  usage_type,\n  record_type,\n  currency_code,\n  price_status,\n  COUNT(*) AS billing_records,\n  COUNT(DISTINCT attributed_user_name) AS distinct_billed_users,\n  ROUND(SUM(usage_quantity), 6) AS usage_quantity,\n  ROUND(SUM(list_cost), 6) AS list_cost,\n  ROUND(SUM(list_cost) / NULLIF(SUM(usage_quantity), 0), 6) AS effective_unit_price\nFROM priced_usage\nGROUP BY ALL"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "overview",
+      "displayName": "Overview",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layout": [
+        {
+          "widget": {
+            "name": "overview-title",
+            "multilineTextboxSpec": {
+              "lines": [
+                "# Genie PAYGO Cost Explorer"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "overview-subtitle",
+            "multilineTextboxSpec": {
+              "lines": [
+                "Paid usage at effective list price. Invoice discounts and exact Genie Code session/thread attribution are outside this dashboard."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 1,
+            "width": 6,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "overview-filter-date",
+            "queries": [
+              {
+                "name": "q_overview_filter_date",
+                "query": {
+                  "datasetName": "billing_detail",
+                  "fields": [
+                    {
+                      "name": "usage_date",
+                      "expression": "`usage_date`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-date-range-picker",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "usage_date",
+                    "displayName": "Usage date",
+                    "queryName": "q_overview_filter_date"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Usage date"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "overview-filter-surface",
+            "queries": [
+              {
+                "name": "q_overview_filter_surface",
+                "query": {
+                  "datasetName": "billing_detail",
+                  "fields": [
+                    {
+                      "name": "genie_surface",
+                      "expression": "`genie_surface`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "genie_surface",
+                    "displayName": "Genie surface",
+                    "queryName": "q_overview_filter_surface"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Genie surface"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "overview-filter-channel",
+            "queries": [
+              {
+                "name": "q_overview_filter_channel",
+                "query": {
+                  "datasetName": "billing_detail",
+                  "fields": [
+                    {
+                      "name": "genie_channel",
+                      "expression": "`genie_channel`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "genie_channel",
+                    "displayName": "Channel",
+                    "queryName": "q_overview_filter_channel"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Channel"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "overview-filter-workspace",
+            "queries": [
+              {
+                "name": "q_overview_filter_workspace",
+                "query": {
+                  "datasetName": "billing_detail",
+                  "fields": [
+                    {
+                      "name": "workspace_id",
+                      "expression": "`workspace_id`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "workspace_id",
+                    "displayName": "Workspace ID",
+                    "queryName": "q_overview_filter_workspace"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Workspace ID"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 4,
+            "width": 3,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "overview-filter-user",
+            "queries": [
+              {
+                "name": "q_overview_filter_user",
+                "query": {
+                  "datasetName": "billing_detail",
+                  "fields": [
+                    {
+                      "name": "user_name",
+                      "expression": "`user_name`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "user_name",
+                    "displayName": "Billed user",
+                    "queryName": "q_overview_filter_user"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Billed user"
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 4,
+            "width": 3,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "overview-filter-offering",
+            "queries": [
+              {
+                "name": "q_overview_filter_offering",
+                "query": {
+                  "datasetName": "billing_detail",
+                  "fields": [
+                    {
+                      "name": "offering_type",
+                      "expression": "`offering_type`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "offering_type",
+                    "displayName": "Offering",
+                    "queryName": "q_overview_filter_offering"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Offering"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 6,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "overview-filter-record",
+            "queries": [
+              {
+                "name": "q_overview_filter_record",
+                "query": {
+                  "datasetName": "billing_detail",
+                  "fields": [
+                    {
+                      "name": "record_type",
+                      "expression": "`record_type`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "record_type",
+                    "displayName": "Record type",
+                    "queryName": "q_overview_filter_record"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Record type"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 6,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "overview-filter-price",
+            "queries": [
+              {
+                "name": "q_overview_filter_price",
+                "query": {
+                  "datasetName": "billing_detail",
+                  "fields": [
+                    {
+                      "name": "price_status",
+                      "expression": "`price_status`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "price_status",
+                    "displayName": "Price status",
+                    "queryName": "q_overview_filter_price"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Price status"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 6,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "overview-filter-attribution",
+            "queries": [
+              {
+                "name": "q_overview_filter_attribution",
+                "query": {
+                  "datasetName": "billing_detail",
+                  "fields": [
+                    {
+                      "name": "user_attribution_status",
+                      "expression": "`user_attribution_status`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "user_attribution_status",
+                    "displayName": "User attribution",
+                    "queryName": "q_overview_filter_attribution"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "User attribution"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 8,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "overview-filter-currency",
+            "queries": [
+              {
+                "name": "q_overview_filter_currency",
+                "query": {
+                  "datasetName": "billing_detail",
+                  "fields": [
+                    {
+                      "name": "currency_code",
+                      "expression": "`currency_code`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "currency_code",
+                    "displayName": "Currency",
+                    "queryName": "q_overview_filter_currency"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Currency"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 8,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "overview-filter-usage-type",
+            "queries": [
+              {
+                "name": "q_overview_filter_usage_type",
+                "query": {
+                  "datasetName": "billing_detail",
+                  "fields": [
+                    {
+                      "name": "usage_type",
+                      "expression": "`usage_type`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "usage_type",
+                    "displayName": "Usage type",
+                    "queryName": "q_overview_filter_usage_type"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Usage type"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 8,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi-list-cost",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "billing_detail",
+                  "fields": [
+                    {
+                      "name": "sum(list_cost)",
+                      "expression": "SUM(`list_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(list_cost)",
+                  "displayName": "Total list cost"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Total list cost"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 10,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi-users",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "billing_detail",
+                  "fields": [
+                    {
+                      "name": "countdistinct(attributed_user_name)",
+                      "expression": "COUNT(DISTINCT `attributed_user_name`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "countdistinct(attributed_user_name)",
+                  "displayName": "Attributed identities"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Attributed identities"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 10,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi-workspaces",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "billing_detail",
+                  "fields": [
+                    {
+                      "name": "countdistinct(workspace_id)",
+                      "expression": "COUNT(DISTINCT `workspace_id`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "countdistinct(workspace_id)",
+                  "displayName": "Workspaces"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Workspaces"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 10,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "overview-trends-header",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Cost trend"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 13,
+            "width": 6,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "daily-cost-surface",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "billing_detail",
+                  "fields": [
+                    {
+                      "name": "day(usage_date)",
+                      "expression": "DATE_TRUNC(\"DAY\", `usage_date`)"
+                    },
+                    {
+                      "name": "sum(list_cost)",
+                      "expression": "SUM(`list_cost`)"
+                    },
+                    {
+                      "name": "genie_surface",
+                      "expression": "`genie_surface`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "day(usage_date)",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Usage Date"
+                },
+                "y": {
+                  "fieldName": "sum(list_cost)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "List Cost"
+                },
+                "color": {
+                  "fieldName": "genie_surface",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "Genie Surface"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Daily list cost by Genie surface"
+              },
+              "mark": {
+                "colors": [
+                  "#FFAB00",
+                  "#00A972",
+                  "#FF3621",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#99DDB4"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 14,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "cost-by-surface",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "billing_detail",
+                  "fields": [
+                    {
+                      "name": "sum(list_cost)",
+                      "expression": "SUM(`list_cost`)"
+                    },
+                    {
+                      "name": "genie_surface",
+                      "expression": "`genie_surface`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "pie",
+              "encodings": {
+                "angle": {
+                  "fieldName": "sum(list_cost)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "List cost"
+                },
+                "color": {
+                  "fieldName": "genie_surface",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "Genie Surface"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "List cost by surface"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 20,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "cost-by-channel",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "billing_detail",
+                  "fields": [
+                    {
+                      "name": "genie_channel",
+                      "expression": "`genie_channel`"
+                    },
+                    {
+                      "name": "sum(list_cost)",
+                      "expression": "SUM(`list_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "genie_channel",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "y-reversed"
+                    }
+                  },
+                  "displayName": "Genie Channel"
+                },
+                "y": {
+                  "fieldName": "sum(list_cost)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "List Cost"
+                },
+                "label": {
+                  "show": false
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "List cost by channel"
+              },
+              "mark": {
+                "colors": [
+                  "#FFAB00",
+                  "#00A972",
+                  "#FF3621",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#99DDB4"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 20,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "overview-detail-header",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Hourly billing detail"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 26,
+            "width": 6,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "billing-detail-table",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "billing_detail",
+                  "fields": [
+                    {
+                      "name": "usage_date",
+                      "expression": "`usage_date`"
+                    },
+                    {
+                      "name": "usage_hour_utc",
+                      "expression": "`usage_hour_utc`"
+                    },
+                    {
+                      "name": "workspace_id",
+                      "expression": "`workspace_id`"
+                    },
+                    {
+                      "name": "user_name",
+                      "expression": "`user_name`"
+                    },
+                    {
+                      "name": "genie_surface",
+                      "expression": "`genie_surface`"
+                    },
+                    {
+                      "name": "genie_channel",
+                      "expression": "`genie_channel`"
+                    },
+                    {
+                      "name": "agent_id",
+                      "expression": "`agent_id`"
+                    },
+                    {
+                      "name": "sku_name",
+                      "expression": "`sku_name`"
+                    },
+                    {
+                      "name": "usage_type",
+                      "expression": "`usage_type`"
+                    },
+                    {
+                      "name": "record_type",
+                      "expression": "`record_type`"
+                    },
+                    {
+                      "name": "usage_quantity",
+                      "expression": "`usage_quantity`"
+                    },
+                    {
+                      "name": "list_cost",
+                      "expression": "`list_cost`"
+                    },
+                    {
+                      "name": "currency_code",
+                      "expression": "`currency_code`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "usage_date",
+                    "displayName": "Usage date"
+                  },
+                  {
+                    "fieldName": "usage_hour_utc",
+                    "displayName": "Hour UTC"
+                  },
+                  {
+                    "fieldName": "workspace_id",
+                    "displayName": "Workspace ID"
+                  },
+                  {
+                    "fieldName": "user_name",
+                    "displayName": "Billed identity"
+                  },
+                  {
+                    "fieldName": "genie_surface",
+                    "displayName": "Surface"
+                  },
+                  {
+                    "fieldName": "genie_channel",
+                    "displayName": "Channel"
+                  },
+                  {
+                    "fieldName": "agent_id",
+                    "displayName": "Agent or space ID"
+                  },
+                  {
+                    "fieldName": "sku_name",
+                    "displayName": "SKU"
+                  },
+                  {
+                    "fieldName": "usage_type",
+                    "displayName": "Usage type"
+                  },
+                  {
+                    "fieldName": "record_type",
+                    "displayName": "Record type"
+                  },
+                  {
+                    "fieldName": "usage_quantity",
+                    "displayName": "Usage quantity"
+                  },
+                  {
+                    "fieldName": "list_cost",
+                    "displayName": "List cost"
+                  },
+                  {
+                    "fieldName": "currency_code",
+                    "displayName": "Currency"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Granular paid Genie usage"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 27,
+            "width": 6,
+            "height": 8
+          }
+        }
+      ]
+    },
+    {
+      "name": "drivers",
+      "displayName": "Cost drivers",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layout": [
+        {
+          "widget": {
+            "name": "drivers-title",
+            "multilineTextboxSpec": {
+              "lines": [
+                "# Cost drivers"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "drivers-subtitle",
+            "multilineTextboxSpec": {
+              "lines": [
+                "Top 15 dimensions over the dashboard's rolling 30-day source window. Agent or space ID is not a Genie Code session ID."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 1,
+            "width": 6,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "top-users",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "driver_rankings",
+                  "fields": [
+                    {
+                      "name": "top_user",
+                      "expression": "`top_user`"
+                    },
+                    {
+                      "name": "sum(top_user_cost)",
+                      "expression": "SUM(`top_user_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "top_user",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "y-reversed"
+                    }
+                  },
+                  "displayName": "Top User"
+                },
+                "y": {
+                  "fieldName": "sum(top_user_cost)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Top User Cost"
+                },
+                "label": {
+                  "show": false
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Top billed identities"
+              },
+              "mark": {
+                "colors": [
+                  "#FFAB00",
+                  "#00A972",
+                  "#FF3621",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#99DDB4"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "top-workspaces",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "driver_rankings",
+                  "fields": [
+                    {
+                      "name": "top_workspace",
+                      "expression": "`top_workspace`"
+                    },
+                    {
+                      "name": "sum(top_workspace_cost)",
+                      "expression": "SUM(`top_workspace_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "top_workspace",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "y-reversed"
+                    }
+                  },
+                  "displayName": "Top Workspace"
+                },
+                "y": {
+                  "fieldName": "sum(top_workspace_cost)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Top Workspace Cost"
+                },
+                "label": {
+                  "show": false
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Top workspaces"
+              },
+              "mark": {
+                "colors": [
+                  "#FFAB00",
+                  "#00A972",
+                  "#FF3621",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#99DDB4"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 2,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "top-agent-space",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "driver_rankings",
+                  "fields": [
+                    {
+                      "name": "top_agent_or_space_id",
+                      "expression": "`top_agent_or_space_id`"
+                    },
+                    {
+                      "name": "sum(top_agent_or_space_cost)",
+                      "expression": "SUM(`top_agent_or_space_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "top_agent_or_space_id",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "y-reversed"
+                    }
+                  },
+                  "displayName": "Top Agent Or Space Id"
+                },
+                "y": {
+                  "fieldName": "sum(top_agent_or_space_cost)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Top Agent Or Space Cost"
+                },
+                "label": {
+                  "show": false
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Top agent or space IDs"
+              },
+              "mark": {
+                "colors": [
+                  "#FFAB00",
+                  "#00A972",
+                  "#FF3621",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#99DDB4"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 8,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "top-skus",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "driver_rankings",
+                  "fields": [
+                    {
+                      "name": "top_sku",
+                      "expression": "`top_sku`"
+                    },
+                    {
+                      "name": "sum(top_sku_cost)",
+                      "expression": "SUM(`top_sku_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "top_sku",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "y-reversed"
+                    }
+                  },
+                  "displayName": "Top Sku"
+                },
+                "y": {
+                  "fieldName": "sum(top_sku_cost)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Top Sku Cost"
+                },
+                "label": {
+                  "show": false
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Top SKUs"
+              },
+              "mark": {
+                "colors": [
+                  "#FFAB00",
+                  "#00A972",
+                  "#FF3621",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#99DDB4"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 8,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "top-surfaces",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "driver_rankings",
+                  "fields": [
+                    {
+                      "name": "top_surface",
+                      "expression": "`top_surface`"
+                    },
+                    {
+                      "name": "sum(top_surface_cost)",
+                      "expression": "SUM(`top_surface_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "top_surface",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "y-reversed"
+                    }
+                  },
+                  "displayName": "Top Surface"
+                },
+                "y": {
+                  "fieldName": "sum(top_surface_cost)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Top Surface Cost"
+                },
+                "label": {
+                  "show": false
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Cost by surface"
+              },
+              "mark": {
+                "colors": [
+                  "#FFAB00",
+                  "#00A972",
+                  "#FF3621",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#99DDB4"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 14,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "top-channels",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "driver_rankings",
+                  "fields": [
+                    {
+                      "name": "top_channel",
+                      "expression": "`top_channel`"
+                    },
+                    {
+                      "name": "sum(top_channel_cost)",
+                      "expression": "SUM(`top_channel_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "top_channel",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "y-reversed"
+                    }
+                  },
+                  "displayName": "Top Channel"
+                },
+                "y": {
+                  "fieldName": "sum(top_channel_cost)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Top Channel Cost"
+                },
+                "label": {
+                  "show": false
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Cost by channel"
+              },
+              "mark": {
+                "colors": [
+                  "#FFAB00",
+                  "#00A972",
+                  "#FF3621",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#99DDB4"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 14,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "driver-rank-table",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "driver_rankings",
+                  "fields": [
+                    {
+                      "name": "driver_rank",
+                      "expression": "`driver_rank`"
+                    },
+                    {
+                      "name": "top_user",
+                      "expression": "`top_user`"
+                    },
+                    {
+                      "name": "top_user_cost",
+                      "expression": "`top_user_cost`"
+                    },
+                    {
+                      "name": "top_user_share",
+                      "expression": "`top_user_share`"
+                    },
+                    {
+                      "name": "top_workspace",
+                      "expression": "`top_workspace`"
+                    },
+                    {
+                      "name": "top_workspace_cost",
+                      "expression": "`top_workspace_cost`"
+                    },
+                    {
+                      "name": "top_workspace_share",
+                      "expression": "`top_workspace_share`"
+                    },
+                    {
+                      "name": "top_agent_or_space_id",
+                      "expression": "`top_agent_or_space_id`"
+                    },
+                    {
+                      "name": "top_agent_or_space_cost",
+                      "expression": "`top_agent_or_space_cost`"
+                    },
+                    {
+                      "name": "top_sku",
+                      "expression": "`top_sku`"
+                    },
+                    {
+                      "name": "top_sku_cost",
+                      "expression": "`top_sku_cost`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "driver_rank",
+                    "displayName": "Rank"
+                  },
+                  {
+                    "fieldName": "top_user",
+                    "displayName": "User"
+                  },
+                  {
+                    "fieldName": "top_user_cost",
+                    "displayName": "User cost"
+                  },
+                  {
+                    "fieldName": "top_user_share",
+                    "displayName": "User share"
+                  },
+                  {
+                    "fieldName": "top_workspace",
+                    "displayName": "Workspace"
+                  },
+                  {
+                    "fieldName": "top_workspace_cost",
+                    "displayName": "Workspace cost"
+                  },
+                  {
+                    "fieldName": "top_workspace_share",
+                    "displayName": "Workspace share"
+                  },
+                  {
+                    "fieldName": "top_agent_or_space_id",
+                    "displayName": "Agent or space ID"
+                  },
+                  {
+                    "fieldName": "top_agent_or_space_cost",
+                    "displayName": "Agent or space cost"
+                  },
+                  {
+                    "fieldName": "top_sku",
+                    "displayName": "SKU"
+                  },
+                  {
+                    "fieldName": "top_sku_cost",
+                    "displayName": "SKU cost"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Ranked driver detail"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 20,
+            "width": 6,
+            "height": 8
+          }
+        }
+      ]
+    },
+    {
+      "name": "sku_product",
+      "displayName": "SKU by product",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layout": [
+        {
+          "widget": {
+            "name": "sku-product-title",
+            "multilineTextboxSpec": {
+              "lines": [
+                "# SKU billing by Genie product"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "sku-product-subtitle",
+            "multilineTextboxSpec": {
+              "lines": [
+                "Genie product is the billing surface. Amounts are effective list-price estimates; use the table for daily workspace-level detail."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 1,
+            "width": 6,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "sku-filter-date",
+            "queries": [
+              {
+                "name": "q_sku_filter_date",
+                "query": {
+                  "datasetName": "sku_product_detail",
+                  "fields": [
+                    {
+                      "name": "usage_date",
+                      "expression": "`usage_date`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-date-range-picker",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "usage_date",
+                    "displayName": "Usage date",
+                    "queryName": "q_sku_filter_date"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Usage date"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "sku-filter-product",
+            "queries": [
+              {
+                "name": "q_sku_filter_product",
+                "query": {
+                  "datasetName": "sku_product_detail",
+                  "fields": [
+                    {
+                      "name": "genie_product",
+                      "expression": "`genie_product`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "genie_product",
+                    "displayName": "Genie product",
+                    "queryName": "q_sku_filter_product"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Genie product"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "sku-filter-workspace",
+            "queries": [
+              {
+                "name": "q_sku_filter_workspace",
+                "query": {
+                  "datasetName": "sku_product_detail",
+                  "fields": [
+                    {
+                      "name": "workspace_id",
+                      "expression": "`workspace_id`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "workspace_id",
+                    "displayName": "Workspace ID",
+                    "queryName": "q_sku_filter_workspace"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Workspace ID"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "sku-filter-name",
+            "queries": [
+              {
+                "name": "q_sku_filter_name",
+                "query": {
+                  "datasetName": "sku_product_detail",
+                  "fields": [
+                    {
+                      "name": "sku_name",
+                      "expression": "`sku_name`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "sku_name",
+                    "displayName": "SKU",
+                    "queryName": "q_sku_filter_name"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "SKU"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 4,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "sku-filter-channel",
+            "queries": [
+              {
+                "name": "q_sku_filter_channel",
+                "query": {
+                  "datasetName": "sku_product_detail",
+                  "fields": [
+                    {
+                      "name": "genie_channel",
+                      "expression": "`genie_channel`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "genie_channel",
+                    "displayName": "Channel",
+                    "queryName": "q_sku_filter_channel"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Channel"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 4,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "sku-filter-offering",
+            "queries": [
+              {
+                "name": "q_sku_filter_offering",
+                "query": {
+                  "datasetName": "sku_product_detail",
+                  "fields": [
+                    {
+                      "name": "offering_type",
+                      "expression": "`offering_type`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "offering_type",
+                    "displayName": "Offering",
+                    "queryName": "q_sku_filter_offering"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Offering"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 4,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "sku-filter-unit",
+            "queries": [
+              {
+                "name": "q_sku_filter_unit",
+                "query": {
+                  "datasetName": "sku_product_detail",
+                  "fields": [
+                    {
+                      "name": "usage_unit",
+                      "expression": "`usage_unit`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "usage_unit",
+                    "displayName": "Usage unit",
+                    "queryName": "q_sku_filter_unit"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Usage unit"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 6,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "sku-filter-usage-type",
+            "queries": [
+              {
+                "name": "q_sku_filter_usage_type",
+                "query": {
+                  "datasetName": "sku_product_detail",
+                  "fields": [
+                    {
+                      "name": "usage_type",
+                      "expression": "`usage_type`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "usage_type",
+                    "displayName": "Usage type",
+                    "queryName": "q_sku_filter_usage_type"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Usage type"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 6,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "sku-filter-record",
+            "queries": [
+              {
+                "name": "q_sku_filter_record",
+                "query": {
+                  "datasetName": "sku_product_detail",
+                  "fields": [
+                    {
+                      "name": "record_type",
+                      "expression": "`record_type`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "record_type",
+                    "displayName": "Record type",
+                    "queryName": "q_sku_filter_record"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Record type"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 6,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "sku-filter-currency",
+            "queries": [
+              {
+                "name": "q_sku_filter_currency",
+                "query": {
+                  "datasetName": "sku_product_detail",
+                  "fields": [
+                    {
+                      "name": "currency_code",
+                      "expression": "`currency_code`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "currency_code",
+                    "displayName": "Currency",
+                    "queryName": "q_sku_filter_currency"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Currency"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 8,
+            "width": 3,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "sku-filter-price",
+            "queries": [
+              {
+                "name": "q_sku_filter_price",
+                "query": {
+                  "datasetName": "sku_product_detail",
+                  "fields": [
+                    {
+                      "name": "price_status",
+                      "expression": "`price_status`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "price_status",
+                    "displayName": "Price status",
+                    "queryName": "q_sku_filter_price"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Price status"
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 8,
+            "width": 3,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "sku-kpi-cost",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "sku_product_detail",
+                  "fields": [
+                    {
+                      "name": "sum(list_cost)",
+                      "expression": "SUM(`list_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(list_cost)",
+                  "displayName": "Total SKU list cost"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Total SKU list cost"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 10,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "sku-kpi-count",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "sku_product_detail",
+                  "fields": [
+                    {
+                      "name": "countdistinct(sku_name)",
+                      "expression": "COUNT(DISTINCT `sku_name`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "countdistinct(sku_name)",
+                  "displayName": "Distinct SKUs"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Distinct SKUs"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 10,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "sku-kpi-records",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "sku_product_detail",
+                  "fields": [
+                    {
+                      "name": "sum(billing_records)",
+                      "expression": "SUM(`billing_records`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(billing_records)",
+                  "displayName": "Billing records"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Billing records"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 10,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "sku-chart-header",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## SKU cost by product"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 13,
+            "width": 6,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "sku-cost-by-product",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "sku_product_detail",
+                  "fields": [
+                    {
+                      "name": "sku_name",
+                      "expression": "`sku_name`"
+                    },
+                    {
+                      "name": "sum(list_cost)",
+                      "expression": "SUM(`list_cost`)"
+                    },
+                    {
+                      "name": "genie_product",
+                      "expression": "`genie_product`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "sku_name",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "y-reversed"
+                    }
+                  },
+                  "displayName": "Sku Name"
+                },
+                "y": {
+                  "fieldName": "sum(list_cost)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "List Cost"
+                },
+                "label": {
+                  "show": false
+                },
+                "color": {
+                  "fieldName": "genie_product",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "Genie Product"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "List cost by SKU and Genie product"
+              },
+              "mark": {
+                "colors": [
+                  "#FFAB00",
+                  "#00A972",
+                  "#FF3621",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#99DDB4"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 14,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "sku-detail-header",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Detailed billed SKU records"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 20,
+            "width": 6,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "sku-product-detail-table",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "sku_product_detail",
+                  "fields": [
+                    {
+                      "name": "usage_date",
+                      "expression": "`usage_date`"
+                    },
+                    {
+                      "name": "workspace_id",
+                      "expression": "`workspace_id`"
+                    },
+                    {
+                      "name": "genie_product",
+                      "expression": "`genie_product`"
+                    },
+                    {
+                      "name": "sku_name",
+                      "expression": "`sku_name`"
+                    },
+                    {
+                      "name": "genie_channel",
+                      "expression": "`genie_channel`"
+                    },
+                    {
+                      "name": "offering_type",
+                      "expression": "`offering_type`"
+                    },
+                    {
+                      "name": "usage_unit",
+                      "expression": "`usage_unit`"
+                    },
+                    {
+                      "name": "usage_type",
+                      "expression": "`usage_type`"
+                    },
+                    {
+                      "name": "record_type",
+                      "expression": "`record_type`"
+                    },
+                    {
+                      "name": "currency_code",
+                      "expression": "`currency_code`"
+                    },
+                    {
+                      "name": "price_status",
+                      "expression": "`price_status`"
+                    },
+                    {
+                      "name": "billing_records",
+                      "expression": "`billing_records`"
+                    },
+                    {
+                      "name": "distinct_billed_users",
+                      "expression": "`distinct_billed_users`"
+                    },
+                    {
+                      "name": "usage_quantity",
+                      "expression": "`usage_quantity`"
+                    },
+                    {
+                      "name": "effective_unit_price",
+                      "expression": "`effective_unit_price`"
+                    },
+                    {
+                      "name": "list_cost",
+                      "expression": "`list_cost`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "usage_date",
+                    "displayName": "Usage date"
+                  },
+                  {
+                    "fieldName": "workspace_id",
+                    "displayName": "Workspace ID"
+                  },
+                  {
+                    "fieldName": "genie_product",
+                    "displayName": "Genie product"
+                  },
+                  {
+                    "fieldName": "sku_name",
+                    "displayName": "SKU"
+                  },
+                  {
+                    "fieldName": "genie_channel",
+                    "displayName": "Channel"
+                  },
+                  {
+                    "fieldName": "offering_type",
+                    "displayName": "Offering"
+                  },
+                  {
+                    "fieldName": "usage_unit",
+                    "displayName": "Usage unit"
+                  },
+                  {
+                    "fieldName": "usage_type",
+                    "displayName": "Usage type"
+                  },
+                  {
+                    "fieldName": "record_type",
+                    "displayName": "Record type"
+                  },
+                  {
+                    "fieldName": "currency_code",
+                    "displayName": "Currency"
+                  },
+                  {
+                    "fieldName": "price_status",
+                    "displayName": "Price status"
+                  },
+                  {
+                    "fieldName": "billing_records",
+                    "displayName": "Billing records"
+                  },
+                  {
+                    "fieldName": "distinct_billed_users",
+                    "displayName": "Billed users"
+                  },
+                  {
+                    "fieldName": "usage_quantity",
+                    "displayName": "Usage quantity"
+                  },
+                  {
+                    "fieldName": "effective_unit_price",
+                    "displayName": "Effective unit price"
+                  },
+                  {
+                    "fieldName": "list_cost",
+                    "displayName": "List cost"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Daily SKU billing detail by Genie product"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 21,
+            "width": 6,
+            "height": 9
+          }
+        }
+      ]
+    },
+    {
+      "name": "quality",
+      "displayName": "Quality and spikes",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layout": [
+        {
+          "widget": {
+            "name": "quality-title",
+            "multilineTextboxSpec": {
+              "lines": [
+                "# Attribution quality and spikes"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "quality-subtitle",
+            "multilineTextboxSpec": {
+              "lines": [
+                "Page filters apply consistently to both quality datasets. The baseline is the exact prior seven-calendar-day average, including zero-cost days."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 1,
+            "width": 6,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "quality-filter-date",
+            "queries": [
+              {
+                "name": "q_quality_filter_date",
+                "query": {
+                  "datasetName": "attribution_quality",
+                  "fields": [
+                    {
+                      "name": "usage_date",
+                      "expression": "`usage_date`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-date-range-picker",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "usage_date",
+                    "displayName": "Usage date",
+                    "queryName": "q_quality_filter_date"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Usage date"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "quality-filter-surface",
+            "queries": [
+              {
+                "name": "q_quality_filter_surface",
+                "query": {
+                  "datasetName": "attribution_quality",
+                  "fields": [
+                    {
+                      "name": "genie_surface",
+                      "expression": "`genie_surface`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "genie_surface",
+                    "displayName": "Genie surface",
+                    "queryName": "q_quality_filter_surface"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Genie surface"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "quality-filter-channel",
+            "queries": [
+              {
+                "name": "q_quality_filter_channel",
+                "query": {
+                  "datasetName": "attribution_quality",
+                  "fields": [
+                    {
+                      "name": "genie_channel",
+                      "expression": "`genie_channel`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "genie_channel",
+                    "displayName": "Channel",
+                    "queryName": "q_quality_filter_channel"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Channel"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi-records",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "attribution_quality",
+                  "fields": [
+                    {
+                      "name": "sum(billing_records)",
+                      "expression": "SUM(`billing_records`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(billing_records)",
+                  "displayName": "Billing records"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Billing records"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 4,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi-missing-users",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "attribution_quality",
+                  "fields": [
+                    {
+                      "name": "sum(records_without_user)",
+                      "expression": "SUM(`records_without_user`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(records_without_user)",
+                  "displayName": "Records without user"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Records without user"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 4,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi-unattributed-cost",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "attribution_quality",
+                  "fields": [
+                    {
+                      "name": "sum(unattributed_list_cost)",
+                      "expression": "SUM(`unattributed_list_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(unattributed_list_cost)",
+                  "displayName": "Unattributed list cost"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Unattributed list cost"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 4,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "cost-vs-baseline",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "daily_trends",
+                  "fields": [
+                    {
+                      "name": "daily(usage_date)",
+                      "expression": "DATE_TRUNC(\"DAY\", `usage_date`)"
+                    },
+                    {
+                      "name": "sum(list_cost)",
+                      "expression": "SUM(`list_cost`)"
+                    },
+                    {
+                      "name": "sum(prior_7d_avg_cost)",
+                      "expression": "SUM(`prior_7d_avg_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "daily(usage_date)",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Usage Date"
+                },
+                "y": {
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "fields": [
+                    {
+                      "fieldName": "sum(list_cost)",
+                      "displayName": "List Cost"
+                    },
+                    {
+                      "fieldName": "sum(prior_7d_avg_cost)",
+                      "displayName": "Prior 7D Avg Cost"
+                    }
+                  ]
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Daily list cost vs prior 7-calendar-day average"
+              },
+              "mark": {
+                "colors": [
+                  "#FFAB00",
+                  "#00A972",
+                  "#FF3621",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#99DDB4"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 7,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "coverage-trend",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "attribution_quality",
+                  "fields": [
+                    {
+                      "name": "day(usage_date)",
+                      "expression": "DATE_TRUNC(\"DAY\", `usage_date`)"
+                    },
+                    {
+                      "name": "avg(user_coverage_ratio)",
+                      "expression": "AVG(`user_coverage_ratio`)"
+                    },
+                    {
+                      "name": "genie_surface",
+                      "expression": "`genie_surface`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "day(usage_date)",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Usage Date"
+                },
+                "y": {
+                  "fieldName": "avg(user_coverage_ratio)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "User Coverage Ratio"
+                },
+                "color": {
+                  "fieldName": "genie_surface",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "Genie Surface"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Average workspace-segment user coverage"
+              },
+              "mark": {
+                "colors": [
+                  "#FFAB00",
+                  "#00A972",
+                  "#FF3621",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#99DDB4"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 13,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "variance-by-surface",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "daily_trends",
+                  "fields": [
+                    {
+                      "name": "genie_surface",
+                      "expression": "`genie_surface`"
+                    },
+                    {
+                      "name": "avg(variance_vs_prior_7d)",
+                      "expression": "AVG(`variance_vs_prior_7d`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "genie_surface",
+                  "scale": {
+                    "type": "categorical",
+                    "sort": {
+                      "by": "y-reversed"
+                    }
+                  },
+                  "displayName": "Genie Surface"
+                },
+                "y": {
+                  "fieldName": "avg(variance_vs_prior_7d)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Variance Vs Prior 7D"
+                },
+                "label": {
+                  "show": false
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Average variance vs prior 7 calendar days"
+              },
+              "mark": {
+                "colors": [
+                  "#FFAB00",
+                  "#00A972",
+                  "#FF3621",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#99DDB4"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 13,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "quality-detail-table",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "attribution_quality",
+                  "fields": [
+                    {
+                      "name": "usage_date",
+                      "expression": "`usage_date`"
+                    },
+                    {
+                      "name": "workspace_id",
+                      "expression": "`workspace_id`"
+                    },
+                    {
+                      "name": "genie_surface",
+                      "expression": "`genie_surface`"
+                    },
+                    {
+                      "name": "genie_channel",
+                      "expression": "`genie_channel`"
+                    },
+                    {
+                      "name": "billing_records",
+                      "expression": "`billing_records`"
+                    },
+                    {
+                      "name": "records_without_user",
+                      "expression": "`records_without_user`"
+                    },
+                    {
+                      "name": "user_coverage_ratio",
+                      "expression": "`user_coverage_ratio`"
+                    },
+                    {
+                      "name": "agent_id_coverage_ratio",
+                      "expression": "`agent_id_coverage_ratio`"
+                    },
+                    {
+                      "name": "price_coverage_ratio",
+                      "expression": "`price_coverage_ratio`"
+                    },
+                    {
+                      "name": "unattributed_list_cost",
+                      "expression": "`unattributed_list_cost`"
+                    },
+                    {
+                      "name": "list_cost",
+                      "expression": "`list_cost`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "usage_date",
+                    "displayName": "Usage date"
+                  },
+                  {
+                    "fieldName": "workspace_id",
+                    "displayName": "Workspace ID"
+                  },
+                  {
+                    "fieldName": "genie_surface",
+                    "displayName": "Surface"
+                  },
+                  {
+                    "fieldName": "genie_channel",
+                    "displayName": "Channel"
+                  },
+                  {
+                    "fieldName": "billing_records",
+                    "displayName": "Records"
+                  },
+                  {
+                    "fieldName": "records_without_user",
+                    "displayName": "Missing user records"
+                  },
+                  {
+                    "fieldName": "user_coverage_ratio",
+                    "displayName": "User coverage"
+                  },
+                  {
+                    "fieldName": "agent_id_coverage_ratio",
+                    "displayName": "Agent ID coverage"
+                  },
+                  {
+                    "fieldName": "price_coverage_ratio",
+                    "displayName": "Price coverage"
+                  },
+                  {
+                    "fieldName": "unattributed_list_cost",
+                    "displayName": "Unattributed list cost"
+                  },
+                  {
+                    "fieldName": "list_cost",
+                    "displayName": "List cost"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Attribution-quality detail"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 19,
+            "width": 6,
+            "height": 8
+          }
+        }
+      ]
+    },
+    {
+      "name": "activity",
+      "displayName": "Activity context",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layout": [
+        {
+          "widget": {
+            "name": "activity-title",
+            "multilineTextboxSpec": {
+              "lines": [
+                "# Genie Code activity context"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "activity-subtitle",
+            "multilineTextboxSpec": {
+              "lines": [
+                "Workspace and user filters apply to both activity datasets. User/workspace/hour comparison is heuristic and cannot produce exact session cost."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 1,
+            "width": 6,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "activity-filter-workspace",
+            "queries": [
+              {
+                "name": "q_activity_filter_workspace",
+                "query": {
+                  "datasetName": "assistant_activity",
+                  "fields": [
+                    {
+                      "name": "workspace_id",
+                      "expression": "`workspace_id`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "workspace_id",
+                    "displayName": "Workspace ID",
+                    "queryName": "q_activity_filter_workspace"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Workspace ID"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 3,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "activity-filter-user",
+            "queries": [
+              {
+                "name": "q_activity_filter_user",
+                "query": {
+                  "datasetName": "assistant_activity",
+                  "fields": [
+                    {
+                      "name": "user_name",
+                      "expression": "`user_name`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "user_name",
+                    "displayName": "User",
+                    "queryName": "q_activity_filter_user"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "User"
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 2,
+            "width": 3,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi-events",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "assistant_activity",
+                  "fields": [
+                    {
+                      "name": "sum(assistant_events)",
+                      "expression": "SUM(`assistant_events`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(assistant_events)",
+                  "displayName": "Assistant events"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Assistant events"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 4,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi-code-cost",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "user_hour_context",
+                  "fields": [
+                    {
+                      "name": "sum(list_cost)",
+                      "expression": "SUM(`list_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(list_cost)",
+                  "displayName": "Genie Code list cost"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Genie Code list cost"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 4,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi-context-users",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "user_hour_context",
+                  "fields": [
+                    {
+                      "name": "countdistinct(user_name)",
+                      "expression": "COUNT(DISTINCT `user_name`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "countdistinct(user_name)",
+                  "displayName": "Users in context"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Users in context"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 4,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "assistant-events-trend",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "assistant_activity",
+                  "fields": [
+                    {
+                      "name": "day(event_date)",
+                      "expression": "DATE_TRUNC(\"DAY\", `event_date`)"
+                    },
+                    {
+                      "name": "sum(assistant_events)",
+                      "expression": "SUM(`assistant_events`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "day(event_date)",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Event Date"
+                },
+                "y": {
+                  "fieldName": "sum(assistant_events)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Assistant Events"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Assistant events by day"
+              },
+              "mark": {
+                "colors": [
+                  "#FFAB00",
+                  "#00A972",
+                  "#FF3621",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#99DDB4"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 7,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "code-cost-hourly",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "user_hour_context",
+                  "fields": [
+                    {
+                      "name": "hour(activity_hour_utc)",
+                      "expression": "DATE_TRUNC(\"HOUR\", `activity_hour_utc`)"
+                    },
+                    {
+                      "name": "sum(list_cost)",
+                      "expression": "SUM(`list_cost`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "hour(activity_hour_utc)",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Activity Hour Utc"
+                },
+                "y": {
+                  "fieldName": "sum(list_cost)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "List Cost"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Genie Code list cost by hour"
+              },
+              "mark": {
+                "colors": [
+                  "#FFAB00",
+                  "#00A972",
+                  "#FF3621",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#99DDB4"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 7,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "user-hour-context-table",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "user_hour_context",
+                  "fields": [
+                    {
+                      "name": "activity_hour_utc",
+                      "expression": "`activity_hour_utc`"
+                    },
+                    {
+                      "name": "workspace_id",
+                      "expression": "`workspace_id`"
+                    },
+                    {
+                      "name": "user_name",
+                      "expression": "`user_name`"
+                    },
+                    {
+                      "name": "billing_records",
+                      "expression": "`billing_records`"
+                    },
+                    {
+                      "name": "usage_quantity",
+                      "expression": "`usage_quantity`"
+                    },
+                    {
+                      "name": "list_cost",
+                      "expression": "`list_cost`"
+                    },
+                    {
+                      "name": "assistant_events",
+                      "expression": "`assistant_events`"
+                    },
+                    {
+                      "name": "attribution_limit",
+                      "expression": "`attribution_limit`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "activity_hour_utc",
+                    "displayName": "Hour UTC"
+                  },
+                  {
+                    "fieldName": "workspace_id",
+                    "displayName": "Workspace ID"
+                  },
+                  {
+                    "fieldName": "user_name",
+                    "displayName": "User"
+                  },
+                  {
+                    "fieldName": "billing_records",
+                    "displayName": "Billing records"
+                  },
+                  {
+                    "fieldName": "usage_quantity",
+                    "displayName": "Usage quantity"
+                  },
+                  {
+                    "fieldName": "list_cost",
+                    "displayName": "List cost"
+                  },
+                  {
+                    "fieldName": "assistant_events",
+                    "displayName": "Assistant events"
+                  },
+                  {
+                    "fieldName": "attribution_limit",
+                    "displayName": "Attribution limit"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Heuristic user/workspace/hour comparison"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 13,
+            "width": 6,
+            "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "assistant-activity-table",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "assistant_activity",
+                  "fields": [
+                    {
+                      "name": "event_date",
+                      "expression": "`event_date`"
+                    },
+                    {
+                      "name": "event_hour_utc",
+                      "expression": "`event_hour_utc`"
+                    },
+                    {
+                      "name": "workspace_id",
+                      "expression": "`workspace_id`"
+                    },
+                    {
+                      "name": "user_name",
+                      "expression": "`user_name`"
+                    },
+                    {
+                      "name": "user_agent",
+                      "expression": "`user_agent`"
+                    },
+                    {
+                      "name": "assistant_events",
+                      "expression": "`assistant_events`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "event_date",
+                    "displayName": "Event date"
+                  },
+                  {
+                    "fieldName": "event_hour_utc",
+                    "displayName": "Hour UTC"
+                  },
+                  {
+                    "fieldName": "workspace_id",
+                    "displayName": "Workspace ID"
+                  },
+                  {
+                    "fieldName": "user_name",
+                    "displayName": "User"
+                  },
+                  {
+                    "fieldName": "user_agent",
+                    "displayName": "User agent"
+                  },
+                  {
+                    "fieldName": "assistant_events",
+                    "displayName": "Events"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Assistant-event detail"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 21,
+            "width": 6,
+            "height": 8
+          }
+        }
+      ]
+    }
+  ],
+  "uiSettings": {
+    "theme": {
+      "widgetHeaderAlignment": "ALIGNMENT_UNSPECIFIED"
+    },
+    "applyModeEnabled": false
+  }
+}
