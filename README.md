@@ -2,6 +2,10 @@
 
 This is a production-oriented, import-only package for Databricks workspaces on AWS, Azure, or GCP. It analyzes paid Genie usage and effective list-price cost. Importing the dashboard creates an editable dashboard in the importing user's folder. The package does not contain scripts, change Unity Catalog grants, publish the dashboard, share it, or alter existing resources.
 
+## Disclaimer
+
+This package is a private initiative. It is not an official Databricks product, feature, or supported solution and is provided as-is. Use is at the customer's own responsibility and risk. The customer must review, test, secure, approve, operate, and monitor it under its own policies before production use.
+
 The dashboard includes seven datasets, five pages, and 68 widgets. It breaks down cost by time, workspace, billed identity, Genie product, channel, agent or space ID, offering, SKU, usage unit/type, correction record, currency, and attribution quality. The simplified **Overview** keeps only usage date, Genie surface, channel, workspace, and billed-user filters. The **SKU by product** page retains the detailed filters and billing detail needed for deeper analysis.
 
 ## Package contents
