@@ -1,4 +1,4 @@
--- Azure Databricks: Genie PAYGO Cost Explorer
+-- Databricks on AWS, Azure, and GCP: Genie PAYGO Cost Explorer
 -- Run each numbered statement separately in the SQL editor.
 -- Default scope: rolling 30 calendar days across all workspaces visible to the account.
 -- To scope one workspace, set target_workspace_id in each statement's params CTE.
@@ -9,10 +9,19 @@
 -- session/thread cost attribution. Query 7 is explicitly heuristic.
 -- Required: SELECT on system.billing.usage and system.billing.list_prices.
 -- Queries 6-7 also require SELECT on system.access.assistant_events.
--- Azure documentation:
+-- Official documentation by cloud:
+-- AWS:
+-- https://docs.databricks.com/aws/en/genie/budgets#query-genie-usage-and-cost
+-- https://docs.databricks.com/aws/en/admin/system-tables/billing
+-- https://docs.databricks.com/aws/en/admin/system-tables/assistant
+-- Azure:
 -- https://learn.microsoft.com/en-us/azure/databricks/genie/budgets#query-genie-usage-and-cost
 -- https://learn.microsoft.com/en-us/azure/databricks/admin/system-tables/billing
 -- https://learn.microsoft.com/en-us/azure/databricks/admin/system-tables/assistant
+-- GCP:
+-- https://docs.databricks.com/gcp/en/genie/budgets#query-genie-usage-and-cost
+-- https://docs.databricks.com/gcp/en/admin/system-tables/billing
+-- https://docs.databricks.com/gcp/en/admin/system-tables/assistant
 
 -- ============================================================================
 -- 1. Raw billing records: maximum available system.billing granularity

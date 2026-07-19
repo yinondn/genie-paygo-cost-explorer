@@ -305,264 +305,6 @@
         },
         {
           "widget": {
-            "name": "overview-filter-offering",
-            "queries": [
-              {
-                "name": "q_overview_filter_offering",
-                "query": {
-                  "datasetName": "billing_detail",
-                  "fields": [
-                    {
-                      "name": "offering_type",
-                      "expression": "`offering_type`"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              }
-            ],
-            "spec": {
-              "version": 2,
-              "widgetType": "filter-multi-select",
-              "encodings": {
-                "fields": [
-                  {
-                    "fieldName": "offering_type",
-                    "displayName": "Offering",
-                    "queryName": "q_overview_filter_offering"
-                  }
-                ]
-              },
-              "frame": {
-                "showTitle": true,
-                "title": "Offering"
-              }
-            }
-          },
-          "position": {
-            "x": 0,
-            "y": 6,
-            "width": 2,
-            "height": 2
-          }
-        },
-        {
-          "widget": {
-            "name": "overview-filter-record",
-            "queries": [
-              {
-                "name": "q_overview_filter_record",
-                "query": {
-                  "datasetName": "billing_detail",
-                  "fields": [
-                    {
-                      "name": "record_type",
-                      "expression": "`record_type`"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              }
-            ],
-            "spec": {
-              "version": 2,
-              "widgetType": "filter-multi-select",
-              "encodings": {
-                "fields": [
-                  {
-                    "fieldName": "record_type",
-                    "displayName": "Record type",
-                    "queryName": "q_overview_filter_record"
-                  }
-                ]
-              },
-              "frame": {
-                "showTitle": true,
-                "title": "Record type"
-              }
-            }
-          },
-          "position": {
-            "x": 2,
-            "y": 6,
-            "width": 2,
-            "height": 2
-          }
-        },
-        {
-          "widget": {
-            "name": "overview-filter-price",
-            "queries": [
-              {
-                "name": "q_overview_filter_price",
-                "query": {
-                  "datasetName": "billing_detail",
-                  "fields": [
-                    {
-                      "name": "price_status",
-                      "expression": "`price_status`"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              }
-            ],
-            "spec": {
-              "version": 2,
-              "widgetType": "filter-multi-select",
-              "encodings": {
-                "fields": [
-                  {
-                    "fieldName": "price_status",
-                    "displayName": "Price status",
-                    "queryName": "q_overview_filter_price"
-                  }
-                ]
-              },
-              "frame": {
-                "showTitle": true,
-                "title": "Price status"
-              }
-            }
-          },
-          "position": {
-            "x": 4,
-            "y": 6,
-            "width": 2,
-            "height": 2
-          }
-        },
-        {
-          "widget": {
-            "name": "overview-filter-attribution",
-            "queries": [
-              {
-                "name": "q_overview_filter_attribution",
-                "query": {
-                  "datasetName": "billing_detail",
-                  "fields": [
-                    {
-                      "name": "user_attribution_status",
-                      "expression": "`user_attribution_status`"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              }
-            ],
-            "spec": {
-              "version": 2,
-              "widgetType": "filter-multi-select",
-              "encodings": {
-                "fields": [
-                  {
-                    "fieldName": "user_attribution_status",
-                    "displayName": "User attribution",
-                    "queryName": "q_overview_filter_attribution"
-                  }
-                ]
-              },
-              "frame": {
-                "showTitle": true,
-                "title": "User attribution"
-              }
-            }
-          },
-          "position": {
-            "x": 0,
-            "y": 8,
-            "width": 2,
-            "height": 2
-          }
-        },
-        {
-          "widget": {
-            "name": "overview-filter-currency",
-            "queries": [
-              {
-                "name": "q_overview_filter_currency",
-                "query": {
-                  "datasetName": "billing_detail",
-                  "fields": [
-                    {
-                      "name": "currency_code",
-                      "expression": "`currency_code`"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              }
-            ],
-            "spec": {
-              "version": 2,
-              "widgetType": "filter-multi-select",
-              "encodings": {
-                "fields": [
-                  {
-                    "fieldName": "currency_code",
-                    "displayName": "Currency",
-                    "queryName": "q_overview_filter_currency"
-                  }
-                ]
-              },
-              "frame": {
-                "showTitle": true,
-                "title": "Currency"
-              }
-            }
-          },
-          "position": {
-            "x": 2,
-            "y": 8,
-            "width": 2,
-            "height": 2
-          }
-        },
-        {
-          "widget": {
-            "name": "overview-filter-usage-type",
-            "queries": [
-              {
-                "name": "q_overview_filter_usage_type",
-                "query": {
-                  "datasetName": "billing_detail",
-                  "fields": [
-                    {
-                      "name": "usage_type",
-                      "expression": "`usage_type`"
-                    }
-                  ],
-                  "disaggregated": false
-                }
-              }
-            ],
-            "spec": {
-              "version": 2,
-              "widgetType": "filter-multi-select",
-              "encodings": {
-                "fields": [
-                  {
-                    "fieldName": "usage_type",
-                    "displayName": "Usage type",
-                    "queryName": "q_overview_filter_usage_type"
-                  }
-                ]
-              },
-              "frame": {
-                "showTitle": true,
-                "title": "Usage type"
-              }
-            }
-          },
-          "position": {
-            "x": 4,
-            "y": 8,
-            "width": 2,
-            "height": 2
-          }
-        },
-        {
-          "widget": {
             "name": "kpi-list-cost",
             "queries": [
               {
@@ -596,7 +338,7 @@
           },
           "position": {
             "x": 0,
-            "y": 10,
+            "y": 6,
             "width": 2,
             "height": 3
           }
@@ -636,7 +378,7 @@
           },
           "position": {
             "x": 2,
-            "y": 10,
+            "y": 6,
             "width": 2,
             "height": 3
           }
@@ -676,7 +418,7 @@
           },
           "position": {
             "x": 4,
-            "y": 10,
+            "y": 6,
             "width": 2,
             "height": 3
           }
@@ -692,7 +434,7 @@
           },
           "position": {
             "x": 0,
-            "y": 13,
+            "y": 9,
             "width": 6,
             "height": 1
           }
@@ -767,7 +509,7 @@
           },
           "position": {
             "x": 0,
-            "y": 14,
+            "y": 10,
             "width": 6,
             "height": 6
           }
@@ -821,7 +563,7 @@
           },
           "position": {
             "x": 0,
-            "y": 20,
+            "y": 16,
             "width": 3,
             "height": 6
           }
@@ -891,7 +633,7 @@
           },
           "position": {
             "x": 3,
-            "y": 20,
+            "y": 16,
             "width": 3,
             "height": 6
           }
@@ -907,7 +649,7 @@
           },
           "position": {
             "x": 0,
-            "y": 26,
+            "y": 22,
             "width": 6,
             "height": 1
           }
@@ -1045,7 +787,7 @@
           },
           "position": {
             "x": 0,
-            "y": 27,
+            "y": 23,
             "width": 6,
             "height": 8
           }
