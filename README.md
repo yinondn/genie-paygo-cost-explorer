@@ -16,7 +16,7 @@ This package is a private initiative. It is not an official Databricks product, 
 
 - Permission to create a dashboard.
 - Access to an approved SQL warehouse.
-- Query access to `system.billing.usage`, `system.billing.list_prices`, and `system.access.assistant_events`.
+- Query access to `system.billing.usage`, `system.billing.list_prices`, `system.access.assistant_events`, `system.serving.endpoint_usage`, and `system.serving.served_entities`.
 
 ## Import the dashboard
 
@@ -33,6 +33,7 @@ This package is a private initiative. It is not an official Databricks product, 
 - Cost is an estimated effective list-price amount, not an invoice amount. It excludes negotiated discounts, credits, taxes, and free or unbilled allowance.
 - `agent_id` identifies an agent or space when populated; it is not a Genie Code session or thread identifier.
 - The user/workspace/hour activity comparison is heuristic and does not provide exact session-level cost attribution.
+- Endpoint token context is a seven-day heuristic correlation by account, workspace, billed identity/requester, and UTC hour. It has no shared request ID or Genie marker and must not be used to allocate tokens to a Genie request, session, SKU, invoice, or chargeback.
 
 ## Documentation
 

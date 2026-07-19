@@ -9,6 +9,8 @@
 -- session/thread cost attribution. Query 7 is explicitly heuristic.
 -- Required: SELECT on system.billing.usage and system.billing.list_prices.
 -- Queries 6-7 also require SELECT on system.access.assistant_events.
+-- Query 9 also requires SELECT on system.serving.endpoint_usage and
+-- system.serving.served_entities. It is contextual only, not exact attribution.
 -- Official documentation by cloud:
 -- AWS:
 -- https://docs.databricks.com/aws/en/genie/budgets#query-genie-usage-and-cost
@@ -531,3 +533,154 @@ SELECT
   ROUND(SUM(list_cost) / NULLIF(SUM(usage_quantity), 0), 6) AS effective_unit_price
 FROM priced_usage
 GROUP BY ALL;
+
+-- ============================================================================
+-- 9. Heuristic endpoint token context by user, workspace, and hour
+-- ============================================================================
+WITH params AS (
+  SELECT
+    DATE_SUB(CURRENT_DATE(), 6) AS start_date,
+    DATE_ADD(CURRENT_DATE(), 1) AS end_date_exclusive
+),
+genie_billing_buckets AS (
+  SELECT
+    u.account_id,
+    u.workspace_id,
+    LOWER(TRIM(u.identity_metadata.run_as)) AS requester_key,
+    MAX(u.identity_metadata.run_as) AS billed_identity,
+    DATE_TRUNC('HOUR', u.usage_start_time) AS usage_hour_utc,
+    CONCAT_WS(
+      ', ',
+      SORT_ARRAY(COLLECT_SET(COALESCE(u.usage_metadata.genie.surface, 'Unknown')))
+    ) AS genie_surfaces,
+    CONCAT_WS(', ', SORT_ARRAY(COLLECT_SET(u.sku_name))) AS inference_skus,
+    COUNT(DISTINCT COALESCE(u.usage_metadata.genie.surface, 'Unknown'))
+      AS genie_surface_count,
+    COUNT(DISTINCT u.sku_name) AS genie_sku_count,
+    COUNT(*) AS billing_records,
+    ROUND(SUM(u.usage_quantity), 6) AS inference_usage_dbus
+  FROM system.billing.usage AS u
+  CROSS JOIN params AS p
+  WHERE u.billing_origin_product = 'GENIE'
+    AND u.usage_date >= p.start_date
+    AND u.usage_date < p.end_date_exclusive
+    AND u.usage_type = 'TOKEN'
+    AND u.usage_unit = 'DBU'
+    AND (
+      UPPER(u.sku_name) LIKE '%REAL_TIME_INFERENCE%'
+      OR UPPER(u.sku_name) LIKE '%MODEL_SERVING%'
+    )
+    AND u.identity_metadata.run_as IS NOT NULL
+    AND TRIM(u.identity_metadata.run_as) <> ''
+  GROUP BY
+    u.account_id,
+    u.workspace_id,
+    LOWER(TRIM(u.identity_metadata.run_as)),
+    DATE_TRUNC('HOUR', u.usage_start_time)
+),
+endpoint_request_buckets AS (
+  SELECT
+    e.account_id,
+    e.workspace_id,
+    LOWER(TRIM(e.requester)) AS requester_key,
+    DATE_TRUNC('HOUR', e.request_time) AS usage_hour_utc,
+    e.served_entity_id,
+    COUNT(*) AS endpoint_requests,
+    COUNT_IF(e.status_code >= 200 AND e.status_code < 300) AS successful_requests,
+    SUM(COALESCE(e.input_token_count, 0)) AS input_tokens,
+    SUM(COALESCE(e.output_token_count, 0)) AS output_tokens,
+    SUM(
+      COALESCE(e.input_token_count, 0) + COALESCE(e.output_token_count, 0)
+    ) AS total_tokens
+  FROM system.serving.endpoint_usage AS e
+  INNER JOIN genie_billing_buckets AS b
+    ON e.account_id = b.account_id
+    AND e.workspace_id = b.workspace_id
+    AND LOWER(TRIM(e.requester)) = b.requester_key
+    AND DATE_TRUNC('HOUR', e.request_time) = b.usage_hour_utc
+  GROUP BY
+    e.account_id,
+    e.workspace_id,
+    LOWER(TRIM(e.requester)),
+    DATE_TRUNC('HOUR', e.request_time),
+    e.served_entity_id
+  HAVING SUM(
+    COALESCE(e.input_token_count, 0) + COALESCE(e.output_token_count, 0)
+  ) > 0
+),
+endpoint_request_counts AS (
+  SELECT
+    *,
+    COUNT(*) OVER (
+      PARTITION BY account_id, workspace_id, requester_key, usage_hour_utc
+    ) AS served_entity_count
+  FROM endpoint_request_buckets
+),
+served_entities_latest AS (
+  SELECT
+    account_id,
+    workspace_id,
+    served_entity_id,
+    endpoint_id,
+    endpoint_name,
+    served_entity_name,
+    entity_type,
+    entity_name,
+    entity_version
+  FROM system.serving.served_entities
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY account_id, workspace_id, served_entity_id
+    ORDER BY change_time DESC, endpoint_config_version DESC
+  ) = 1
+)
+SELECT
+  CAST(b.usage_hour_utc AS DATE) AS usage_date,
+  b.usage_hour_utc,
+  b.account_id,
+  b.workspace_id,
+  b.billed_identity AS requester,
+  r.served_entity_id,
+  COALESCE(s.endpoint_id, 'Unknown') AS endpoint_id,
+  COALESCE(s.endpoint_name, 'Unknown') AS endpoint_name,
+  COALESCE(
+    s.served_entity_name,
+    s.entity_name,
+    s.endpoint_name,
+    r.served_entity_id
+  ) AS served_entity_label,
+  COALESCE(s.entity_type, 'Unknown') AS entity_type,
+  COALESCE(s.entity_name, 'Unknown') AS entity_name,
+  COALESCE(s.entity_version, 'Unknown') AS entity_version,
+  b.genie_surfaces,
+  b.inference_skus,
+  b.billing_records,
+  b.inference_usage_dbus,
+  r.endpoint_requests,
+  r.successful_requests,
+  r.input_tokens,
+  r.output_tokens,
+  r.total_tokens,
+  b.genie_surface_count,
+  b.genie_sku_count,
+  r.served_entity_count,
+  CASE
+    WHEN b.genie_surface_count = 1
+      AND b.genie_sku_count = 1
+      AND r.served_entity_count = 1
+      THEN 'Narrower heuristic'
+    ELSE 'Ambiguous heuristic'
+  END AS correlation_quality,
+  'Same account, workspace, billed identity/requester, and UTC hour'
+    AS correlation_basis,
+  'Context only: no shared request ID or Genie marker; tokens must not be allocated to a Genie request, session, SKU, invoice, or chargeback.'
+    AS attribution_limit
+FROM genie_billing_buckets AS b
+INNER JOIN endpoint_request_counts AS r
+  ON b.account_id = r.account_id
+  AND b.workspace_id = r.workspace_id
+  AND b.requester_key = r.requester_key
+  AND b.usage_hour_utc = r.usage_hour_utc
+LEFT JOIN served_entities_latest AS s
+  ON r.account_id = s.account_id
+  AND r.workspace_id = s.workspace_id
+  AND r.served_entity_id = s.served_entity_id;

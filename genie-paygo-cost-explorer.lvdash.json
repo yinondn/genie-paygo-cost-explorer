@@ -48,6 +48,13 @@
       "queryLines": [
         "WITH params AS (\n  SELECT\n    DATE_SUB(CURRENT_DATE(), 29) AS start_date,\n    DATE_ADD(CURRENT_DATE(), 1) AS end_date_exclusive,\n    CAST(NULL AS STRING) AS target_workspace_id\n),\npriced_usage AS (\n  SELECT\n    u.usage_date,\n    u.account_id,\n    u.workspace_id,\n    u.identity_metadata.run_as AS attributed_user_name,\n    COALESCE(u.usage_metadata.genie.surface, 'Unknown') AS genie_product,\n    COALESCE(u.usage_metadata.genie.channel, 'Unknown') AS genie_channel,\n    COALESCE(u.product_features.genie.offering_type, 'Unknown') AS offering_type,\n    u.sku_name,\n    u.usage_unit,\n    COALESCE(u.usage_type, 'Unknown') AS usage_type,\n    u.record_type,\n    COALESCE(lp.currency_code, 'Unknown') AS currency_code,\n    CASE WHEN lp.sku_name IS NULL THEN 'Missing price' ELSE 'Priced' END AS price_status,\n    u.usage_quantity,\n    u.usage_quantity * lp.pricing.effective_list.default AS list_cost\n  FROM system.billing.usage AS u\n  CROSS JOIN params AS p\n  LEFT JOIN system.billing.list_prices AS lp\n    ON u.account_id = lp.account_id\n    AND u.cloud = lp.cloud\n    AND u.sku_name = lp.sku_name\n    AND u.usage_unit = lp.usage_unit\n    AND u.usage_start_time >= lp.price_start_time\n    AND (u.usage_start_time < lp.price_end_time OR lp.price_end_time IS NULL)\n  WHERE u.billing_origin_product = 'GENIE'\n    AND u.usage_date >= p.start_date\n    AND u.usage_date < p.end_date_exclusive\n    AND (p.target_workspace_id IS NULL OR u.workspace_id = p.target_workspace_id)\n)\nSELECT\n  usage_date,\n  account_id,\n  workspace_id,\n  genie_product,\n  genie_channel,\n  offering_type,\n  sku_name,\n  usage_unit,\n  usage_type,\n  record_type,\n  currency_code,\n  price_status,\n  COUNT(*) AS billing_records,\n  COUNT(DISTINCT attributed_user_name) AS distinct_billed_users,\n  ROUND(SUM(usage_quantity), 6) AS usage_quantity,\n  ROUND(SUM(list_cost), 6) AS list_cost,\n  ROUND(SUM(list_cost) / NULLIF(SUM(usage_quantity), 0), 6) AS effective_unit_price\nFROM priced_usage\nGROUP BY ALL"
       ]
+    },
+    {
+      "name": "endpoint_token_context",
+      "displayName": "Endpoint Token Context",
+      "queryLines": [
+        "WITH params AS (\n  SELECT\n    DATE_SUB(CURRENT_DATE(), 6) AS start_date,\n    DATE_ADD(CURRENT_DATE(), 1) AS end_date_exclusive\n),\ngenie_billing_buckets AS (\n  SELECT\n    u.account_id,\n    u.workspace_id,\n    LOWER(TRIM(u.identity_metadata.run_as)) AS requester_key,\n    MAX(u.identity_metadata.run_as) AS billed_identity,\n    DATE_TRUNC('HOUR', u.usage_start_time) AS usage_hour_utc,\n    CONCAT_WS(\n      ', ',\n      SORT_ARRAY(COLLECT_SET(COALESCE(u.usage_metadata.genie.surface, 'Unknown')))\n    ) AS genie_surfaces,\n    CONCAT_WS(', ', SORT_ARRAY(COLLECT_SET(u.sku_name))) AS inference_skus,\n    COUNT(DISTINCT COALESCE(u.usage_metadata.genie.surface, 'Unknown'))\n      AS genie_surface_count,\n    COUNT(DISTINCT u.sku_name) AS genie_sku_count,\n    COUNT(*) AS billing_records,\n    ROUND(SUM(u.usage_quantity), 6) AS inference_usage_dbus\n  FROM system.billing.usage AS u\n  CROSS JOIN params AS p\n  WHERE u.billing_origin_product = 'GENIE'\n    AND u.usage_date >= p.start_date\n    AND u.usage_date < p.end_date_exclusive\n    AND u.usage_type = 'TOKEN'\n    AND u.usage_unit = 'DBU'\n    AND (\n      UPPER(u.sku_name) LIKE '%REAL_TIME_INFERENCE%'\n      OR UPPER(u.sku_name) LIKE '%MODEL_SERVING%'\n    )\n    AND u.identity_metadata.run_as IS NOT NULL\n    AND TRIM(u.identity_metadata.run_as) <> ''\n  GROUP BY\n    u.account_id,\n    u.workspace_id,\n    LOWER(TRIM(u.identity_metadata.run_as)),\n    DATE_TRUNC('HOUR', u.usage_start_time)\n),\nendpoint_request_buckets AS (\n  SELECT\n    e.account_id,\n    e.workspace_id,\n    LOWER(TRIM(e.requester)) AS requester_key,\n    DATE_TRUNC('HOUR', e.request_time) AS usage_hour_utc,\n    e.served_entity_id,\n    COUNT(*) AS endpoint_requests,\n    COUNT_IF(e.status_code >= 200 AND e.status_code < 300) AS successful_requests,\n    SUM(COALESCE(e.input_token_count, 0)) AS input_tokens,\n    SUM(COALESCE(e.output_token_count, 0)) AS output_tokens,\n    SUM(\n      COALESCE(e.input_token_count, 0) + COALESCE(e.output_token_count, 0)\n    ) AS total_tokens\n  FROM system.serving.endpoint_usage AS e\n  INNER JOIN genie_billing_buckets AS b\n    ON e.account_id = b.account_id\n    AND e.workspace_id = b.workspace_id\n    AND LOWER(TRIM(e.requester)) = b.requester_key\n    AND DATE_TRUNC('HOUR', e.request_time) = b.usage_hour_utc\n  GROUP BY\n    e.account_id,\n    e.workspace_id,\n    LOWER(TRIM(e.requester)),\n    DATE_TRUNC('HOUR', e.request_time),\n    e.served_entity_id\n  HAVING SUM(\n    COALESCE(e.input_token_count, 0) + COALESCE(e.output_token_count, 0)\n  ) > 0\n),\nendpoint_request_counts AS (\n  SELECT\n    *,\n    COUNT(*) OVER (\n      PARTITION BY account_id, workspace_id, requester_key, usage_hour_utc\n    ) AS served_entity_count\n  FROM endpoint_request_buckets\n),\nserved_entities_latest AS (\n  SELECT\n    account_id,\n    workspace_id,\n    served_entity_id,\n    endpoint_id,\n    endpoint_name,\n    served_entity_name,\n    entity_type,\n    entity_name,\n    entity_version\n  FROM system.serving.served_entities\n  QUALIFY ROW_NUMBER() OVER (\n    PARTITION BY account_id, workspace_id, served_entity_id\n    ORDER BY change_time DESC, endpoint_config_version DESC\n  ) = 1\n)\nSELECT\n  CAST(b.usage_hour_utc AS DATE) AS usage_date,\n  b.usage_hour_utc,\n  b.account_id,\n  b.workspace_id,\n  b.billed_identity AS requester,\n  r.served_entity_id,\n  COALESCE(s.endpoint_id, 'Unknown') AS endpoint_id,\n  COALESCE(s.endpoint_name, 'Unknown') AS endpoint_name,\n  COALESCE(\n    s.served_entity_name,\n    s.entity_name,\n    s.endpoint_name,\n    r.served_entity_id\n  ) AS served_entity_label,\n  COALESCE(s.entity_type, 'Unknown') AS entity_type,\n  COALESCE(s.entity_name, 'Unknown') AS entity_name,\n  COALESCE(s.entity_version, 'Unknown') AS entity_version,\n  b.genie_surfaces,\n  b.inference_skus,\n  b.billing_records,\n  b.inference_usage_dbus,\n  r.endpoint_requests,\n  r.successful_requests,\n  r.input_tokens,\n  r.output_tokens,\n  r.total_tokens,\n  b.genie_surface_count,\n  b.genie_sku_count,\n  r.served_entity_count,\n  CASE\n    WHEN b.genie_surface_count = 1\n      AND b.genie_sku_count = 1\n      AND r.served_entity_count = 1\n      THEN 'Narrower heuristic'\n    ELSE 'Ambiguous heuristic'\n  END AS correlation_quality,\n  'Same account, workspace, billed identity/requester, and UTC hour'\n    AS correlation_basis,\n  'Context only: no shared request ID or Genie marker; tokens must not be allocated to a Genie request, session, SKU, invoice, or chargeback.'\n    AS attribution_limit\nFROM genie_billing_buckets AS b\nINNER JOIN endpoint_request_counts AS r\n  ON b.account_id = r.account_id\n  AND b.workspace_id = r.workspace_id\n  AND b.requester_key = r.requester_key\n  AND b.usage_hour_utc = r.usage_hour_utc\nLEFT JOIN served_entities_latest AS s\n  ON r.account_id = s.account_id\n  AND r.workspace_id = s.workspace_id\n  AND r.served_entity_id = s.served_entity_id"
+      ]
     }
   ],
   "pages": [
@@ -2278,6 +2285,646 @@
             "y": 21,
             "width": 6,
             "height": 9
+          }
+        }
+      ]
+    },
+    {
+      "name": "endpoint_tokens",
+      "displayName": "Endpoint token context",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layout": [
+        {
+          "widget": {
+            "name": "endpoint-token-title",
+            "multilineTextboxSpec": {
+              "lines": [
+                "# Endpoint token context (heuristic)"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "endpoint-token-subtitle",
+            "multilineTextboxSpec": {
+              "lines": [
+                "Rolling seven-day context joined by account, workspace, billed identity/requester, and UTC hour. No shared request ID or Genie marker exists, so these tokens must not be allocated to a Genie request, session, SKU, invoice, or chargeback."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 1,
+            "width": 6,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "endpoint-filter-date",
+            "queries": [
+              {
+                "name": "q_endpoint_filter_date",
+                "query": {
+                  "datasetName": "endpoint_token_context",
+                  "fields": [
+                    {
+                      "name": "usage_date",
+                      "expression": "`usage_date`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-date-range-picker",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "usage_date",
+                    "displayName": "Usage date",
+                    "queryName": "q_endpoint_filter_date"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Usage date"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "endpoint-filter-workspace",
+            "queries": [
+              {
+                "name": "q_endpoint_filter_workspace",
+                "query": {
+                  "datasetName": "endpoint_token_context",
+                  "fields": [
+                    {
+                      "name": "workspace_id",
+                      "expression": "`workspace_id`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "workspace_id",
+                    "displayName": "Workspace ID",
+                    "queryName": "q_endpoint_filter_workspace"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Workspace ID"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "endpoint-filter-requester",
+            "queries": [
+              {
+                "name": "q_endpoint_filter_requester",
+                "query": {
+                  "datasetName": "endpoint_token_context",
+                  "fields": [
+                    {
+                      "name": "requester",
+                      "expression": "`requester`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "requester",
+                    "displayName": "Billed identity / requester",
+                    "queryName": "q_endpoint_filter_requester"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Billed identity / requester"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 2,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "endpoint-filter-quality",
+            "queries": [
+              {
+                "name": "q_endpoint_filter_quality",
+                "query": {
+                  "datasetName": "endpoint_token_context",
+                  "fields": [
+                    {
+                      "name": "correlation_quality",
+                      "expression": "`correlation_quality`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "correlation_quality",
+                    "displayName": "Correlation quality",
+                    "queryName": "q_endpoint_filter_quality"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Correlation quality"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 4,
+            "width": 3,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "endpoint-filter-entity",
+            "queries": [
+              {
+                "name": "q_endpoint_filter_entity",
+                "query": {
+                  "datasetName": "endpoint_token_context",
+                  "fields": [
+                    {
+                      "name": "served_entity_label",
+                      "expression": "`served_entity_label`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-single-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "served_entity_label",
+                    "displayName": "Served entity",
+                    "queryName": "q_endpoint_filter_entity"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Served entity"
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 4,
+            "width": 3,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "endpoint-kpi-input",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "endpoint_token_context",
+                  "fields": [
+                    {
+                      "name": "sum(input_tokens)",
+                      "expression": "SUM(`input_tokens`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(input_tokens)",
+                  "displayName": "Input tokens in correlated buckets"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Input tokens in correlated buckets"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 6,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "endpoint-kpi-output",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "endpoint_token_context",
+                  "fields": [
+                    {
+                      "name": "sum(output_tokens)",
+                      "expression": "SUM(`output_tokens`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(output_tokens)",
+                  "displayName": "Output tokens in correlated buckets"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Output tokens in correlated buckets"
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 6,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "endpoint-kpi-total",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "endpoint_token_context",
+                  "fields": [
+                    {
+                      "name": "sum(total_tokens)",
+                      "expression": "SUM(`total_tokens`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(total_tokens)",
+                  "displayName": "Total tokens in correlated buckets"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Total tokens in correlated buckets"
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 6,
+            "width": 2,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "endpoint-token-trend",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "endpoint_token_context",
+                  "fields": [
+                    {
+                      "name": "hour(usage_hour_utc)",
+                      "expression": "DATE_TRUNC(\"HOUR\", `usage_hour_utc`)"
+                    },
+                    {
+                      "name": "sum(total_tokens)",
+                      "expression": "SUM(`total_tokens`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "hour(usage_hour_utc)",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Usage Hour Utc"
+                },
+                "y": {
+                  "fieldName": "sum(total_tokens)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Total Tokens"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Correlated endpoint tokens by UTC hour"
+              },
+              "mark": {
+                "colors": [
+                  "#FFAB00",
+                  "#00A972",
+                  "#FF3621",
+                  "#8BCAE7",
+                  "#AB4057",
+                  "#99DDB4"
+                ]
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 9,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "endpoint-token-detail",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "endpoint_token_context",
+                  "fields": [
+                    {
+                      "name": "usage_hour_utc",
+                      "expression": "`usage_hour_utc`"
+                    },
+                    {
+                      "name": "workspace_id",
+                      "expression": "`workspace_id`"
+                    },
+                    {
+                      "name": "requester",
+                      "expression": "`requester`"
+                    },
+                    {
+                      "name": "genie_surfaces",
+                      "expression": "`genie_surfaces`"
+                    },
+                    {
+                      "name": "inference_skus",
+                      "expression": "`inference_skus`"
+                    },
+                    {
+                      "name": "correlation_quality",
+                      "expression": "`correlation_quality`"
+                    },
+                    {
+                      "name": "endpoint_name",
+                      "expression": "`endpoint_name`"
+                    },
+                    {
+                      "name": "served_entity_label",
+                      "expression": "`served_entity_label`"
+                    },
+                    {
+                      "name": "served_entity_id",
+                      "expression": "`served_entity_id`"
+                    },
+                    {
+                      "name": "entity_type",
+                      "expression": "`entity_type`"
+                    },
+                    {
+                      "name": "entity_name",
+                      "expression": "`entity_name`"
+                    },
+                    {
+                      "name": "entity_version",
+                      "expression": "`entity_version`"
+                    },
+                    {
+                      "name": "endpoint_requests",
+                      "expression": "`endpoint_requests`"
+                    },
+                    {
+                      "name": "successful_requests",
+                      "expression": "`successful_requests`"
+                    },
+                    {
+                      "name": "input_tokens",
+                      "expression": "`input_tokens`"
+                    },
+                    {
+                      "name": "output_tokens",
+                      "expression": "`output_tokens`"
+                    },
+                    {
+                      "name": "total_tokens",
+                      "expression": "`total_tokens`"
+                    },
+                    {
+                      "name": "billing_records",
+                      "expression": "`billing_records`"
+                    },
+                    {
+                      "name": "inference_usage_dbus",
+                      "expression": "`inference_usage_dbus`"
+                    },
+                    {
+                      "name": "correlation_basis",
+                      "expression": "`correlation_basis`"
+                    },
+                    {
+                      "name": "attribution_limit",
+                      "expression": "`attribution_limit`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "usage_hour_utc",
+                    "displayName": "Hour UTC"
+                  },
+                  {
+                    "fieldName": "workspace_id",
+                    "displayName": "Workspace ID"
+                  },
+                  {
+                    "fieldName": "requester",
+                    "displayName": "Billed identity / requester"
+                  },
+                  {
+                    "fieldName": "genie_surfaces",
+                    "displayName": "Genie surfaces in billing bucket"
+                  },
+                  {
+                    "fieldName": "inference_skus",
+                    "displayName": "Inference SKUs in billing bucket"
+                  },
+                  {
+                    "fieldName": "correlation_quality",
+                    "displayName": "Correlation quality"
+                  },
+                  {
+                    "fieldName": "endpoint_name",
+                    "displayName": "Endpoint"
+                  },
+                  {
+                    "fieldName": "served_entity_label",
+                    "displayName": "Served entity"
+                  },
+                  {
+                    "fieldName": "served_entity_id",
+                    "displayName": "Served entity ID"
+                  },
+                  {
+                    "fieldName": "entity_type",
+                    "displayName": "Entity type"
+                  },
+                  {
+                    "fieldName": "entity_name",
+                    "displayName": "Entity name"
+                  },
+                  {
+                    "fieldName": "entity_version",
+                    "displayName": "Entity version"
+                  },
+                  {
+                    "fieldName": "endpoint_requests",
+                    "displayName": "Endpoint requests"
+                  },
+                  {
+                    "fieldName": "successful_requests",
+                    "displayName": "Successful requests"
+                  },
+                  {
+                    "fieldName": "input_tokens",
+                    "displayName": "Input tokens"
+                  },
+                  {
+                    "fieldName": "output_tokens",
+                    "displayName": "Output tokens"
+                  },
+                  {
+                    "fieldName": "total_tokens",
+                    "displayName": "Total tokens"
+                  },
+                  {
+                    "fieldName": "billing_records",
+                    "displayName": "Genie billing records"
+                  },
+                  {
+                    "fieldName": "inference_usage_dbus",
+                    "displayName": "Inference usage DBUs"
+                  },
+                  {
+                    "fieldName": "correlation_basis",
+                    "displayName": "Correlation basis"
+                  },
+                  {
+                    "fieldName": "attribution_limit",
+                    "displayName": "Attribution limit"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Heuristic endpoint token and served-entity detail"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 15,
+            "width": 6,
+            "height": 10
           }
         }
       ]
